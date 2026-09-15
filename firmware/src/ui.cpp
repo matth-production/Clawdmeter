@@ -218,6 +218,9 @@ static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
 static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
+// ---- Home screen (app launcher) ----
+static lv_obj_t* home_container = nullptr;
+
 // ---- Permission-approval screen ----
 static lv_obj_t* perm_container = nullptr;
 static lv_obj_t* lbl_perm_tool = nullptr;
@@ -245,7 +248,7 @@ static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within t
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
-static screen_t prev_non_splash_screen = SCREEN_USAGE;  // where ui_tick_anim's permission-timeout backstop and perm_button_cb return to
+static screen_t prev_non_splash_screen = SCREEN_HOME;  // where ui_tick_anim's permission-timeout backstop and perm_button_cb return to
 static bool     s_ble_connected = false;   // cached BLE connection state
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
 
@@ -280,6 +283,8 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
 static void perm_button_cb(lv_event_t* e);
+static void go_home_cb(lv_event_t* e);
+static void home_icon_cb(lv_event_t* e);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -444,7 +449,7 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_style_border_width(usage_container, 0, 0);
     lv_obj_set_style_pad_all(usage_container, 0, 0);
     lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(usage_container, go_home_cb, LV_EVENT_CLICKED, NULL);
 
     lbl_title = lv_label_create(usage_container);
     lv_label_set_text(lbl_title, "Usage");
@@ -511,6 +516,75 @@ static void init_usage_screen(lv_obj_t* scr) {
 // PreToolUse hook) is waiting on a physical tap for a pending tool call.
 // A dedicated top-level screen (not a sub-view of usage_container) so its
 // buttons never interact with the tap-anywhere-to-toggle-splash handler.
+// Home screen — the launcher. A simple grid of app tiles; tapping an enabled
+// one navigates straight there (no bubble to the background tap-to-splash
+// handler, since these tiles never get LV_OBJ_FLAG_EVENT_BUBBLE). Tapping
+// blank background area behaves like every other screen: toggle to splash.
+struct AppTile {
+    const char* label;
+    lv_color_t   color;
+    screen_t     target;   // ignored when enabled == false
+    bool         enabled;  // false = dimmed placeholder, not yet wired up
+};
+static const AppTile HOME_APPS[] = {
+    {"Claude",   COL_ACCENT, SCREEN_USAGE, true},
+    {"Slack",    COL_AMBER,  SCREEN_HOME,  false},  // placeholder — target unused
+    {"Life360",  COL_GREEN,  SCREEN_HOME,  false},  // placeholder — target unused
+};
+#define HOME_APP_COUNT (sizeof(HOME_APPS) / sizeof(HOME_APPS[0]))
+
+static void init_home_screen(lv_obj_t* scr) {
+    home_container = lv_obj_create(scr);
+    lv_obj_set_size(home_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(home_container, 0, 0);
+    lv_obj_set_style_bg_color(home_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(home_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(home_container, 0, 0);
+    lv_obj_set_style_pad_all(home_container, 0, 0);
+    lv_obj_clear_flag(home_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(home_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    // One column of tiles — simplest layout that scales to more apps later
+    // without a grid-math rewrite. No header label; the tiles speak for
+    // themselves and it buys more vertical room.
+    const int tile_h = 90;
+    const int gap = 14;
+    const int tile_w = L.content_w;
+    const int start_y = L.margin;
+    for (unsigned i = 0; i < HOME_APP_COUNT; i++) {
+        const AppTile& app = HOME_APPS[i];
+        lv_obj_t* tile = lv_obj_create(home_container);
+        lv_obj_set_size(tile, tile_w, tile_h);
+        lv_obj_set_pos(tile, L.margin, start_y + i * (tile_h + gap));
+        lv_obj_set_style_bg_color(tile, app.color, 0);
+        lv_obj_set_style_bg_opa(tile, app.enabled ? LV_OPA_COVER : LV_OPA_30, 0);
+        lv_obj_set_style_radius(tile, 12, 0);
+        lv_obj_set_style_border_width(tile, 0, 0);
+        lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+        if (app.enabled) {
+            lv_obj_add_event_cb(tile, home_icon_cb, LV_EVENT_CLICKED, (void*)&app);
+        } else {
+            lv_obj_clear_flag(tile, LV_OBJ_FLAG_CLICKABLE);  // dimmed placeholder, inert
+        }
+
+        lv_obj_t* lbl = lv_label_create(tile);
+        lv_label_set_text(lbl, app.enabled ? app.label : app.label /* same text, dimmed via parent opa */);
+        lv_obj_set_style_text_font(lbl, L.bt_device_font, 0);
+        lv_obj_set_style_text_color(lbl, app.enabled ? lv_color_black() : COL_DIM, 0);
+        lv_obj_center(lbl);
+
+        if (!app.enabled) {
+            lv_obj_t* soon = lv_label_create(tile);
+            lv_label_set_text(soon, "coming soon");
+            lv_obj_set_style_text_font(soon, L.pace_font, 0);
+            lv_obj_set_style_text_color(soon, COL_DIM, 0);
+            lv_obj_align(soon, LV_ALIGN_BOTTOM_MID, 0, -4);
+        }
+    }
+
+    lv_obj_add_flag(home_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void init_perm_screen(lv_obj_t* scr) {
     perm_container = lv_obj_create(scr);
     lv_obj_set_size(perm_container, L.scr_w, L.scr_h);
@@ -625,6 +699,10 @@ void ui_init(void) {
         lv_obj_del(battery_img);
         battery_img = nullptr;
     }
+
+    // Home before Permission: Permission is an interrupt over any screen
+    // (including Home), so it must stay the topmost child of scr.
+    init_home_screen(scr);
 
     // Last child of scr → topmost, so it overlays the mascot/logo/battery too.
     init_perm_screen(scr);
@@ -819,6 +897,19 @@ static void global_click_cb(lv_event_t* e) {
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
 
+// Tap anywhere on an app screen (currently just Claude usage) -> back to the
+// Home menu, not straight to splash. Splash is reached from Home the same
+// way it always was (tap background -> global_click_cb).
+static void go_home_cb(lv_event_t* e) {
+    (void)e;
+    ui_show_screen(SCREEN_HOME);
+}
+
+static void home_icon_cb(lv_event_t* e) {
+    const AppTile* app = (const AppTile*)lv_event_get_user_data(e);
+    ui_show_screen(app->target);
+}
+
 // A tap on Deny/Always/Allow. Reports the decision back over BLE (the pending
 // request may already be gone — e.g. the daemon gave up and told the hook to
 // fall back to the normal prompt — the notify is harmless either way, the
@@ -836,10 +927,12 @@ static void perm_button_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     if (perm_container) lv_obj_add_flag(perm_container, LV_OBJ_FLAG_HIDDEN);
+    if (home_container) lv_obj_add_flag(home_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:      splash_show(); break;
+    case SCREEN_HOME:        if (home_container) lv_obj_clear_flag(home_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_USAGE:       lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_PERMISSION:  if (perm_container) lv_obj_clear_flag(perm_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;

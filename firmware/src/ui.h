@@ -4,7 +4,8 @@
 
 enum screen_t {
     SCREEN_SPLASH,
-    SCREEN_USAGE,
+    SCREEN_HOME,       // icon-grid launcher — the "start menu" between splash and any app
+    SCREEN_USAGE,      // the Claude usage app
     SCREEN_PERMISSION,
     SCREEN_COUNT,
 };
