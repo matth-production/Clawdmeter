@@ -369,6 +369,120 @@ def read_clock_setting() -> str:
     return "off"
 
 
+def read_budget_usd() -> float:
+    """Read the `budget_usd` option from the config file. 0 = not configured.
+
+    Anthropic has no API that discloses a Console org's configured spend
+    limit in dollars (only Claude Enterprise exposes one, via admin-only
+    credentials this daemon doesn't have) — so this is the one number we
+    can't derive ourselves. Manually configured, defaults to 0 (disabled):
+    the enterprise spend panel then falls back to the old pace-label-only
+    behavior with no dollar figures and no daily bars.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "budget_usd":
+                    try:
+                        v = float(val.strip())
+                        return v if v > 0 else 0.0
+                    except ValueError:
+                        return 0.0
+    except OSError:
+        pass
+    return 0.0
+
+
+# ---- Daily spend tracking (local-only; see read_budget_usd's docstring for
+# why this can't just be fetched from Anthropic) ----
+#
+# The rate-limit headers only ever give a CURRENT cumulative percentage of
+# the billing period's spend — no history. So we sample it ourselves: each
+# poll, stamp today's date with the latest cumulative %, and on read-back
+# diff consecutive days to get a "how much got spent on day N" series for
+# the current period. This means bars for days before this file existed
+# (or before the current period's tracking started) are simply empty —
+# there's no way to backfill days we didn't observe.
+DAILY_SPEND_FILE = Path.home() / ".config" / "claude-usage-monitor" / "daily_spend.json"
+
+
+def _load_daily_spend_state() -> dict:
+    try:
+        return json.loads(DAILY_SPEND_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_daily_spend_state(state: dict) -> None:
+    try:
+        DAILY_SPEND_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DAILY_SPEND_FILE.write_text(json.dumps(state))
+    except OSError as e:
+        log(f"Failed to save daily spend state: {e}")
+
+
+def update_daily_spend(period_start: datetime.date, period_days: int,
+                       cumulative_pct: float) -> list[float]:
+    """Record today's cumulative % and return this period's day-by-day delta
+    series (length == period_days, one entry per calendar day of the
+    period, 0 for any day with no recorded data yet, current or future)."""
+    state = _load_daily_spend_state()
+    period_key = period_start.isoformat()
+    if state.get("period_start") != period_key:
+        state = {"period_start": period_key, "days": {}}  # new period — start clean
+
+    today_key = datetime.date.today().isoformat()
+    state["days"][today_key] = cumulative_pct
+    _save_daily_spend_state(state)
+
+    days = state["days"]
+    deltas = []
+    prev_cum = 0.0
+    for i in range(period_days):
+        day = (period_start + datetime.timedelta(days=i)).isoformat()
+        cum = days.get(day)
+        if cum is None:
+            deltas.append(0.0)
+            continue  # not observed (before tracking started, or still in the future)
+        deltas.append(max(0.0, cum - prev_cum))
+        prev_cum = cum
+    return deltas
+
+
+def add_budget_fields(payload: dict, session_pct: int, time_pct: int, period_days: int,
+                       period_start_date: "datetime.date") -> None:
+    """Add dollar-based spend fields when a budget is configured; a no-op
+    (payload unchanged) otherwise, so an unconfigured device just keeps the
+    old plain pace-label behavior.
+
+    "bud"  = configured monthly budget in USD
+    "proj" = projected total spend by period end, in USD, extrapolated from
+             the current pace (session_pct / time_pct * budget)
+    "avgd" = the flat "budget / days in period" reference, in USD/day
+    "dd"   = the last 7 calendar days ending today (oldest first, today last),
+             USD spent each day (0 for a day not yet observed — see
+             update_daily_spend). A week, not the whole period, since 480px
+             of screen makes ~30 thin bars illegible; the flat avgd
+             reference is still the period's daily target either way.
+    """
+    budget_usd = read_budget_usd()
+    if budget_usd <= 0:
+        return
+    payload["bud"] = int(round(budget_usd))
+    if time_pct > 0:
+        payload["proj"] = int(round((session_pct / 100 * budget_usd) / (time_pct / 100)))
+    payload["avgd"] = int(round(budget_usd / period_days)) if period_days > 0 else 0
+    deltas_pct = update_daily_spend(period_start_date, period_days, float(session_pct))
+    today_idx = (datetime.date.today() - period_start_date).days
+    week_start = max(0, today_idx - 6)
+    week_pct = deltas_pct[week_start:today_idx + 1]
+    payload["dd"] = [int(round(d / 100 * budget_usd)) for d in week_pct]
+
+
 def add_chime_field(payload: dict) -> None:
     """Add "c":1 to the payload when the config opts in, so the firmware may
     sound the session-reset chime. Omitted entirely when chime is off."""
@@ -463,16 +577,21 @@ async def poll_api(token: str) -> dict | None:
         }
     else:
         reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
+        period_info = _billing_period_info(now, reset_ts)
+        period_start_date = period_info.pop("_period_start_date")
+        session_pct = pct(hdr("anthropic-ratelimit-unified-overage-utilization"))
         payload = {
-            "s": pct(hdr("anthropic-ratelimit-unified-overage-utilization")),
+            "s": session_pct,
             "sr": reset_minutes(reset_ts),
             "w": 0,
             "wr": 0,
             "st": hdr("anthropic-ratelimit-unified-status", "unknown"),
             "acct": "ent",
-            **_billing_period_info(now, reset_ts),
+            **period_info,
             "ok": True,
         }
+        add_budget_fields(payload, session_pct, period_info["tp"], period_info["pd"],
+                          period_start_date)
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
@@ -490,16 +609,17 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     (Claude Enterprise Admin API reference). The doc notes period is an open
     string that may gain other values later; revisit this if so.
     """
+    today = datetime.date.today()
     try:
         period_end = float(reset_ts)
     except ValueError:
-        return {"tp": 0, "pd": 30}
+        return {"tp": 0, "pd": 30, "_period_start_date": today}
     if period_end <= 0:
         # reset_ts defaults to "0" when the overage-reset header is absent.
         # fromtimestamp(0) is 1970; stepping a month back lands in 1969, and
         # datetime.timestamp() raises OSError for pre-1970 dates on Windows.
         # Benign on macOS/Linux, but guard here too to keep the daemons parallel.
-        return {"tp": 0, "pd": 30}
+        return {"tp": 0, "pd": 30, "_period_start_date": today}
     dt_end = datetime.datetime.fromtimestamp(period_end)
     prev_month = dt_end.month - 1 or 12
     prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
@@ -508,7 +628,7 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     period_start = dt_start.timestamp()
     period_len = period_end - period_start
     if period_len <= 0:
-        return {"tp": 0, "pd": 30}
+        return {"tp": 0, "pd": 30, "_period_start_date": today}
     pct_val = (now - period_start) / period_len * 100
     total_days = int(round(period_len / 86400))
     rd = f"{dt_end.strftime('%b')} {dt_end.day}"
@@ -516,6 +636,7 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
         "tp": max(0, min(100, int(round(pct_val)))),
         "pd": total_days,
         "rd": rd,
+        "_period_start_date": dt_start.date(),  # internal only — poll_api pops this before sending
     }
 
 

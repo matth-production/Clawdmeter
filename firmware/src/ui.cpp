@@ -215,7 +215,18 @@ static lv_obj_t* panel_weekly = nullptr;
 // Enterprise-only widgets inside panel_session
 static lv_obj_t* lbl_session_pct_sym = nullptr;  // "%" in smaller font
 static lv_obj_t* lbl_spending_desc = nullptr;     // "of your monthly budget"
-static lv_obj_t* lbl_spending_status = nullptr;   // "Under pace" / "On pace" / "Over pace"
+// Pace/projection line — "Under pace" left-aligned, "~$1,410 by Oct 1"
+// right-aligned, same row. Only shown when the daemon has a configured
+// budget_usd (see data.h); otherwise stays hidden and panel_weekly keeps
+// the plain % + static pace-word view it always had.
+static lv_obj_t* lbl_spending_status = nullptr;  // left: "Under pace" (pace-colored)
+static lv_obj_t* lbl_pace_detail = nullptr;      // right: "~$1,410 by Oct 1" (dim)
+
+// Daily spend bars — replace panel_weekly's "Period" view when a budget is
+// configured. One thin bar per calendar day of the last week (bottom-
+// anchored, height ∝ that day's USD spend). See data.h UsageData::MAX_DAILY.
+#define DAILY_BAR_MAX 7  // a week, matching UsageData::MAX_DAILY
+static lv_obj_t* daily_bars[DAILY_BAR_MAX] = {nullptr};
 static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idle
 
 // ---- Home screen (app launcher) ----
@@ -488,11 +499,21 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_set_pos(lbl_spending_desc, 0, L.usage_reset_y);
     lv_obj_add_flag(lbl_spending_desc, LV_OBJ_FLAG_HIDDEN);
 
+    // Same row lbl_spending_desc uses — the two are mutually exclusive (see
+    // ui_update): budget configured shows this pair instead of the desc,
+    // never both, so there's no stacking/overlap to solve between them.
     lbl_spending_status = lv_label_create(panel_session);
     lv_label_set_text(lbl_spending_status, "");
-    lv_obj_set_style_text_font(lbl_spending_status, L.pace_font, 0);
-    lv_obj_set_pos(lbl_spending_status, 0, L.usage_reset_y + 20);
+    lv_obj_set_style_text_font(lbl_spending_status, &font_styrene_20, 0);  // a step up from L.pace_font (16pt) — was a little small
+    lv_obj_set_pos(lbl_spending_status, 0, L.usage_reset_y);
     lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_pace_detail = lv_label_create(panel_session);
+    lv_label_set_text(lbl_pace_detail, "");
+    lv_obj_set_style_text_font(lbl_pace_detail, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_pace_detail, COL_DIM, 0);
+    lv_obj_align(lbl_pace_detail, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y);
+    lv_obj_add_flag(lbl_pace_detail, LV_OBJ_FLAG_HIDDEN);
 
     panel_weekly = make_usage_panel(usage_group,
                      L.content_y + L.usage_panel_h + L.usage_panel_gap, "Weekly",
@@ -500,6 +521,30 @@ static void init_usage_screen(lv_obj_t* scr) {
                      &bar_weekly, &lbl_weekly_reset);
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
+
+    // Daily spend bars, replacing panel_weekly's content when a budget is
+    // configured (see ui_update). Bottom-anchored (grow up from the panel's
+    // internal bottom edge) in the same content area bar_weekly/lbl_weekly_reset
+    // occupy, so no layout collision between the two modes.
+    {
+        const int content_w = L.content_w - 2 * L.panel_pad_x;
+        const int gap = 3;
+        const int bar_w = (content_w - (DAILY_BAR_MAX - 1) * gap) / DAILY_BAR_MAX;
+        const int pitch = bar_w + gap;
+        const int bars_bottom = L.usage_panel_h - 2 * L.panel_pad_y;
+        for (int i = 0; i < DAILY_BAR_MAX; i++) {
+            lv_obj_t* b = lv_obj_create(panel_weekly);
+            lv_obj_set_size(b, bar_w, 1);  // height set per-update; 1px placeholder
+            lv_obj_set_pos(b, i * pitch, bars_bottom - 1);
+            lv_obj_set_style_bg_color(b, COL_ACCENT, 0);
+            lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(b, 0, 0);
+            lv_obj_set_style_border_width(b, 0, 0);
+            lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+            daily_bars[i] = b;
+        }
+    }
 
     build_pair_group(usage_container);
     build_idle_group(usage_container);
@@ -734,7 +779,8 @@ void ui_update(const UsageData* data) {
         lv_obj_add_flag(lbl_session_reset, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(lbl_spending_status,   LV_OBJ_FLAG_HIDDEN);
+        // lbl_spending_status's own visibility is decided below, once the
+        // pace/projection text is known — depends on data->budget_usd.
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_set_style_text_font(lbl_session_pct, L.pct_font, 0);
@@ -743,6 +789,7 @@ void ui_update(const UsageData* data) {
         lv_obj_add_flag(lbl_session_pct_sym, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_desc,   LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_pace_detail,     LV_OBJ_FLAG_HIDDEN);
         if (panel_weekly) lv_obj_clear_flag(panel_weekly, LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -771,8 +818,61 @@ void ui_update(const UsageData* data) {
     lv_bar_set_value(bar_session, s_pct, LV_ANIM_ON);
     lv_obj_set_style_bg_color(bar_session, pct_color(data->session_pct), LV_PART_INDICATOR);
 
-    if (data->enterprise) {
-        // Period box: time % + dynamic pace color + "Resets <date>" label
+    if (data->enterprise && data->budget_usd > 0) {
+        // Budget configured: pace word (left) + projection (right) on
+        // panel_session, taking over lbl_spending_desc's row — never both
+        // at once, so there's nothing to stack/overlap between them — and
+        // daily spend bars replacing the Period box.
+        lv_obj_add_flag(lbl_spending_desc, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl_pace_detail, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lbl_spending_status, pace_text);
+        lv_obj_set_style_text_color(lbl_spending_status, pace_color, 0);
+        snprintf(buf, sizeof(buf), "~$%d by %s", data->projected_usd, data->reset_date);
+        lv_label_set_text(lbl_pace_detail, buf);
+        lv_obj_align(lbl_pace_detail, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y);  // re-align: text width changed
+
+        lv_label_set_text(lbl_weekly_label, "Daily");
+        lv_obj_add_flag(lbl_weekly_pct, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_weekly_reset, LV_OBJ_FLAG_HIDDEN);
+
+        // Scale bars (and the avg reference line) to the larger of the
+        // busiest tracked day or the avg reference itself, plus headroom,
+        // so an ordinary day doesn't render as a nearly-full bar.
+        int scale_max = data->avg_per_day_usd;
+        for (int i = 0; i < data->daily_count && i < DAILY_BAR_MAX; i++) {
+            if (data->daily_usd[i] > scale_max) scale_max = data->daily_usd[i];
+        }
+        if (scale_max <= 0) scale_max = 1;  // nothing tracked yet — avoid div-by-zero
+        scale_max = scale_max + scale_max / 7;  // ~15% headroom
+
+        const int bars_bottom = L.usage_panel_h - 2 * L.panel_pad_y;
+        const int bars_area_h = bars_bottom - L.usage_bar_y;
+        for (int i = 0; i < DAILY_BAR_MAX; i++) {
+            if (!daily_bars[i]) continue;
+            if (i >= data->daily_count) {
+                lv_obj_add_flag(daily_bars[i], LV_OBJ_FLAG_HIDDEN);
+                continue;
+            }
+            lv_obj_clear_flag(daily_bars[i], LV_OBJ_FLAG_HIDDEN);
+            int h = data->daily_usd[i] * bars_area_h / scale_max;
+            if (h < 1) h = 1;                  // stay visible/tappable-looking even at ~0 spend
+            if (h > bars_area_h) h = bars_area_h;
+            lv_obj_set_height(daily_bars[i], h);
+            lv_obj_set_y(daily_bars[i], bars_bottom - h);
+        }
+    } else if (data->enterprise) {
+        // No budget configured — unchanged plain Period box.
+        lv_obj_add_flag(lbl_spending_status, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lbl_pace_detail,      LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < DAILY_BAR_MAX; i++) {
+            if (daily_bars[i]) lv_obj_add_flag(daily_bars[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_clear_flag(lbl_weekly_pct, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(bar_weekly, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lbl_weekly_reset, LV_OBJ_FLAG_HIDDEN);
+
         lv_label_set_text(lbl_weekly_label, "Period");
         lv_label_set_text_fmt(lbl_weekly_pct, "%d%%", data->time_pct);
         lv_bar_set_value(bar_weekly, data->time_pct, LV_ANIM_ON);

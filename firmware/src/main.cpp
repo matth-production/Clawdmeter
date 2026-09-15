@@ -117,6 +117,19 @@ static bool parse_json(const char* json, UsageData* out) {
     out->time_pct = doc["tp"] | 0;
     out->period_days = doc["pd"] | 30;
     strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
+
+    out->budget_usd = doc["bud"] | 0;
+    out->projected_usd = doc["proj"] | 0;
+    out->avg_per_day_usd = doc["avgd"] | 0;
+    out->daily_count = 0;
+    if (out->budget_usd > 0 && doc["dd"].is<JsonArray>()) {
+        JsonArray dd = doc["dd"].as<JsonArray>();
+        for (JsonVariant v : dd) {
+            if (out->daily_count >= UsageData::MAX_DAILY) break;
+            out->daily_usd[out->daily_count++] = v.as<int>();
+        }
+    }
+
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
