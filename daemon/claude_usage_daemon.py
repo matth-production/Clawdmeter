@@ -528,6 +528,55 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+# ---- Rain-soon alert (Mount Colah, NSW) ----
+#
+# Open-Meteo's minutely_15 forecast: free, no API key, no account -- unlike
+# Slack (needs an app) or Life360 (unofficial/ToS-gray API), this is a
+# public, sanctioned, keyless endpoint. "Rain soon" = precipitation or its
+# probability crosses a threshold in either of the next two 15-min slots
+# (i.e. sometime in the next ~30 minutes).
+RAIN_LAT = -33.6667
+RAIN_LON = 151.1167
+RAIN_CHECK_INTERVAL_S = 600  # forecast granularity doesn't justify checking more often
+RAIN_PRECIP_MM_THRESHOLD = 0.1
+RAIN_PROB_PCT_THRESHOLD = 60
+
+_last_rain_check = 0.0
+_rain_soon_cached = False
+
+
+async def check_rain_soon() -> bool:
+    """Best-effort: a network hiccup keeps the last known state rather than
+    flip-flopping the alert (and re-triggering the device animation/chime)
+    on a transient failure."""
+    global _last_rain_check, _rain_soon_cached
+    now = time.time()
+    if now - _last_rain_check < RAIN_CHECK_INTERVAL_S:
+        return _rain_soon_cached
+    _last_rain_check = now
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": RAIN_LAT,
+                    "longitude": RAIN_LON,
+                    "minutely_15": "precipitation,precipitation_probability",
+                    "timezone": "Australia/Sydney",
+                    "forecast_days": 1,
+                },
+            )
+        resp.raise_for_status()
+        m15 = resp.json()["minutely_15"]
+        precip = m15["precipitation"][:2]
+        prob = m15["precipitation_probability"][:2]
+        _rain_soon_cached = (any(p > RAIN_PRECIP_MM_THRESHOLD for p in precip) or
+                             any(p >= RAIN_PROB_PCT_THRESHOLD for p in prob))
+    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+        log(f"Rain check failed (keeping last known state): {e}")
+    return _rain_soon_cached
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -594,6 +643,7 @@ async def poll_api(token: str) -> dict | None:
                           period_start_date)
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
+    payload["rain"] = await check_rain_soon()
     return payload
 
 

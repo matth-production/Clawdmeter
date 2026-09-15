@@ -132,6 +132,7 @@ static bool parse_json(const char* json, UsageData* out) {
 
     out->clock_epoch = doc["t"] | 0L;
     out->clock_fmt = doc["tf"] | 24;
+    out->rain_soon = doc["rain"] | false;
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -431,6 +432,15 @@ void loop() {
                     g_before, g_after, usage.session_pct);
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
+            // Rising edge only — a still-raining payload every ~60s must not
+            // re-trigger the alert screen/chime on every single poll.
+            static bool last_rain_soon = false;
+            if (usage.rain_soon && !last_rain_soon) {
+                Serial.println("rain expected soon — showing alert");
+                ui_show_rain_alert();
+                sound_hal_play_reset();
+            }
+            last_rain_soon = usage.rain_soon;
             ui_update(&usage);
             ble_send_ack();
         } else {

@@ -24,6 +24,7 @@ struct UsageData {
     int daily_count;           // how many of daily_usd are populated (< 7 in the period's first week)
     long clock_epoch;        // local wall-clock epoch (s) from daemon; 0 = not provided
     int  clock_fmt;          // 12 or 24 (hour format from daemon); defaults to 24
+    bool rain_soon;          // true = rain expected in the next ~30 min (daemon: Open-Meteo)
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };

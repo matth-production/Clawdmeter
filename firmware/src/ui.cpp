@@ -5,6 +5,7 @@
 #include "logo.h"
 #include "clawd_still.h"
 #include "icons.h"
+#include "rain_dog.h"
 #include "hal/board_caps.h"
 #include "idle.h"
 
@@ -232,6 +233,18 @@ static lv_obj_t* lbl_anim;      // status line: connection state + whimsical idl
 // ---- Home screen (app launcher) ----
 static lv_obj_t* home_container = nullptr;
 
+// ---- Rain-soon alert ----
+// A small animated scene (see rain_dog.h) — not Clawd art, a user-supplied
+// GIF instead. Ephemeral: auto-reverts to whatever was showing before after
+// RAIN_ALERT_DURATION_MS, or immediately on tap.
+static lv_obj_t* rain_container = nullptr;
+static lv_obj_t* rain_dog_img = nullptr;
+static lv_image_dsc_t rain_dog_dsc;
+static int rain_frame_idx = 0;
+static uint32_t rain_frame_last_ms = 0;
+static uint32_t rain_shown_at_ms = 0;
+#define RAIN_ALERT_DURATION_MS 15000
+
 // ---- Permission-approval screen ----
 static lv_obj_t* perm_container = nullptr;
 static lv_obj_t* lbl_perm_tool = nullptr;
@@ -296,6 +309,8 @@ static void global_click_cb(lv_event_t* e);
 static void perm_button_cb(lv_event_t* e);
 static void go_home_cb(lv_event_t* e);
 static void home_icon_cb(lv_event_t* e);
+static void rain_dismiss_cb(lv_event_t* e);
+static void reset_rain_anim(void);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -630,6 +645,80 @@ static void init_home_screen(lv_obj_t* scr) {
     lv_obj_add_flag(home_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Advance the rain scene one frame if its hold time elapsed. Called from
+// ui_tick_anim() only while current_screen == SCREEN_RAIN, so this costs
+// nothing while the screen (rare) isn't showing.
+static void rain_tick(void) {
+    uint32_t now = lv_tick_get();
+    if (now - rain_frame_last_ms < rain_dog_frame_ms[rain_frame_idx]) return;
+    rain_frame_last_ms = now;
+    rain_frame_idx = (rain_frame_idx + 1) % RAIN_DOG_FRAME_COUNT;
+    rain_dog_dsc.data = rain_dog_frames[rain_frame_idx];
+    lv_obj_invalidate(rain_dog_img);
+}
+
+static void reset_rain_anim(void) {
+    rain_frame_idx = 0;
+    rain_frame_last_ms = lv_tick_get();
+    rain_dog_dsc.data = rain_dog_frames[0];
+    if (rain_dog_img) lv_obj_invalidate(rain_dog_img);
+}
+
+// Rain-soon alert — the scene from rain_dog.h, cycled frame-by-frame while
+// the screen is visible (rain_tick, driven by ui_tick_anim), plus a caption.
+// rain_dog.h ships LVGL's native 8-bit indexed format (LV_COLOR_FORMAT_I8):
+// each frame's data is a 256-entry BGRA8888 palette (1024 bytes) followed by
+// one index byte per pixel, no row padding. This — not RGB565A8 — is what
+// makes a full 480x480 x 15-frame scene fit this board's flash budget
+// (~3.3MB vs. the ~10MB RGB565A8 would have cost at the same size).
+static void init_rain_dog_dsc(lv_image_dsc_t* dsc, const uint8_t* data) {
+    dsc->header.w = RAIN_DOG_W;
+    dsc->header.h = RAIN_DOG_H;
+    dsc->header.cf = LV_COLOR_FORMAT_I8;
+    dsc->header.stride = RAIN_DOG_W;  // 1 byte/pixel, no padding
+    dsc->data = data;
+    dsc->data_size = 256 * 4 + (uint32_t)RAIN_DOG_W * RAIN_DOG_H;
+}
+
+static void init_rain_screen(lv_obj_t* scr) {
+    rain_container = lv_obj_create(scr);
+    lv_obj_set_size(rain_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(rain_container, 0, 0);
+    lv_obj_set_style_bg_color(rain_container, COL_BG, 0);
+    lv_obj_set_style_bg_opa(rain_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(rain_container, 0, 0);
+    lv_obj_set_style_pad_all(rain_container, 0, 0);
+    lv_obj_clear_flag(rain_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(rain_container, rain_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    init_rain_dog_dsc(&rain_dog_dsc, rain_dog_frames[0]);
+    rain_dog_img = lv_image_create(rain_container);
+    lv_image_set_src(rain_dog_img, &rain_dog_dsc);
+    lv_obj_clear_flag(rain_dog_img, LV_OBJ_FLAG_CLICKABLE);  // taps fall through to rain_container
+    lv_obj_set_pos(rain_dog_img, 0, 0);  // full screen — RAIN_DOG_W/H == L.scr_w/h on this board
+
+    // A solid caption bar along the bottom, drawn over the (opaque) scene —
+    // last child of rain_container, so it paints on top.
+    const int bar_h = 56;
+    lv_obj_t* bar = lv_obj_create(rain_container);
+    lv_obj_set_size(bar, L.scr_w, bar_h);
+    lv_obj_set_pos(bar, 0, L.scr_h - bar_h);
+    lv_obj_set_style_bg_color(bar, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t* lbl = lv_label_create(bar);
+    lv_label_set_text(lbl, "Rain expected soon");
+    lv_obj_set_style_text_font(lbl, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_center(lbl);
+
+    lv_obj_add_flag(rain_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void init_perm_screen(lv_obj_t* scr) {
     perm_container = lv_obj_create(scr);
     lv_obj_set_size(perm_container, L.scr_w, L.scr_h);
@@ -745,9 +834,10 @@ void ui_init(void) {
         battery_img = nullptr;
     }
 
-    // Home before Permission: Permission is an interrupt over any screen
-    // (including Home), so it must stay the topmost child of scr.
+    // Home and Rain before Permission: Permission is an interrupt over any
+    // screen (including these), so it must stay the topmost child of scr.
     init_home_screen(scr);
+    init_rain_screen(scr);
 
     // Last child of scr → topmost, so it overlays the mascot/logo/battery too.
     init_perm_screen(scr);
@@ -929,6 +1019,14 @@ void ui_tick_anim(void) {
         ui_show_screen(prev_non_splash_screen);
         return;
     }
+    if (current_screen == SCREEN_RAIN) {
+        if (lv_tick_get() - rain_shown_at_ms >= RAIN_ALERT_DURATION_MS) {
+            ui_show_screen(prev_non_splash_screen);
+        } else {
+            rain_tick();
+        }
+        return;
+    }
     if (current_screen != SCREEN_USAGE) return;
     update_view_state();
     if (view_state == 1) splash_mini_tick();   // animate the sleeping creature on the idle screen
@@ -985,7 +1083,8 @@ void ui_tick_anim(void) {
 
 static void apply_battery_visibility(void) {
     if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH || current_screen == SCREEN_PERMISSION)
+    if (current_screen == SCREEN_SPLASH || current_screen == SCREEN_PERMISSION ||
+        current_screen == SCREEN_RAIN)
         lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
     else
         lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
@@ -1010,6 +1109,11 @@ static void home_icon_cb(lv_event_t* e) {
     ui_show_screen(app->target);
 }
 
+static void rain_dismiss_cb(lv_event_t* e) {
+    (void)e;
+    ui_show_screen(prev_non_splash_screen);
+}
+
 // A tap on Deny/Always/Allow. Reports the decision back over BLE (the pending
 // request may already be gone — e.g. the daemon gave up and told the hook to
 // fall back to the normal prompt — the notify is harmless either way, the
@@ -1028,6 +1132,7 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     if (perm_container) lv_obj_add_flag(perm_container, LV_OBJ_FLAG_HIDDEN);
     if (home_container) lv_obj_add_flag(home_container, LV_OBJ_FLAG_HIDDEN);
+    if (rain_container) lv_obj_add_flag(rain_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
@@ -1035,16 +1140,18 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_HOME:        if (home_container) lv_obj_clear_flag(home_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_USAGE:       lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_PERMISSION:  if (perm_container) lv_obj_clear_flag(perm_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_RAIN:        if (rain_container) lv_obj_clear_flag(rain_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
-    splash_mascot_set_visible(screen != SCREEN_SPLASH && screen != SCREEN_PERMISSION);
+    bool is_interrupt = (screen == SCREEN_PERMISSION || screen == SCREEN_RAIN);
+    splash_mascot_set_visible(screen != SCREEN_SPLASH && !is_interrupt);
     if (logo_img) {
-        if (screen == SCREEN_SPLASH || screen == SCREEN_PERMISSION) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                                                         lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        if (screen == SCREEN_SPLASH || is_interrupt) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        else                                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (screen != SCREEN_SPLASH && screen != SCREEN_PERMISSION) prev_non_splash_screen = screen;
+    if (screen != SCREEN_SPLASH && !is_interrupt) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_battery_visibility();
 }
@@ -1072,6 +1179,14 @@ void ui_show_permission_request(const char* id, const char* tool, const char* su
     // path here), which reads as an inexplicable multi-minute "delay".
     idle_note_activity();
     ui_show_screen(SCREEN_PERMISSION);
+}
+
+void ui_show_rain_alert(void) {
+    if (!rain_container) return;
+    rain_shown_at_ms = lv_tick_get();
+    idle_note_activity();  // same reasoning as the permission screen — must not be silently invisible on a dimmed panel
+    reset_rain_anim();
+    ui_show_screen(SCREEN_RAIN);
 }
 
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {

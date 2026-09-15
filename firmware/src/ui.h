@@ -7,6 +7,7 @@ enum screen_t {
     SCREEN_HOME,       // icon-grid launcher — the "start menu" between splash and any app
     SCREEN_USAGE,      // the Claude usage app
     SCREEN_PERMISSION,
+    SCREEN_RAIN,       // ephemeral rain-soon alert — auto-reverts after a timeout
     SCREEN_COUNT,
 };
 
@@ -22,3 +23,8 @@ void ui_update_battery(int percent, bool charging);
 // Permission-approval screen. `id` ties the eventual tap back to the host's
 // pending request; `tool` and `summary` are short, pre-truncated strings.
 void ui_show_permission_request(const char* id, const char* tool, const char* summary);
+
+// Ephemeral "rain soon" alert — a small cloud + falling-raindrop animation.
+// Auto-reverts to whatever was showing before after a fixed duration, or on
+// tap. Call on the daemon payload's rain_soon rising edge only (main.cpp).
+void ui_show_rain_alert(void);
